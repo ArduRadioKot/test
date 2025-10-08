@@ -1,21 +1,31 @@
 import telebot
 import sqlite3
 import os
+import secrets
+import string
 
-TOKEN = " "
+TOKEN = "" 
 bot = telebot.TeleBot(TOKEN)
 
+BOT_USERNAME = bot.get_me().username
 NON_ANONYMOUS_IDS = {5250837204, 1901177295, 5141361602}
 
-# Инициализация базы данных
+# Путь к базе данных
 DB_PATH = "bot_data.db"
 
+# Генерация короткого уникального токена
+def generate_token(length=8):
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+# Инициализация базы данных
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS active_users (
-            user_id INTEGER PRIMARY KEY
+            user_id INTEGER PRIMARY KEY,
+            token TEXT UNIQUE NOT NULL
         )
     ''')
     cursor.execute('''
@@ -29,13 +39,32 @@ def init_db():
     conn.commit()
     conn.close()
 
+# Добавление пользователя и генерация токена
 def add_active_user(user_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO active_users (user_id) VALUES (?)", (user_id,))
+    cursor.execute("SELECT 1 FROM active_users WHERE user_id = ?", (user_id,))
+    if cursor.fetchone() is None:
+        while True:
+            token = generate_token()
+            try:
+                cursor.execute("INSERT INTO active_users (user_id, token) VALUES (?, ?)", (user_id, token))
+                break
+            except sqlite3.IntegrityError:
+                continue
     conn.commit()
     conn.close()
 
+# Получить user_id по токену
+def get_user_id_by_token(token):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM active_users WHERE token = ?", (token,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+# Проверка, активен ли пользователь
 def is_user_active(user_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -44,6 +73,7 @@ def is_user_active(user_id):
     conn.close()
     return result is not None
 
+# Сохранение маршрута сообщения
 def save_message_route(recipient_id, message_id, sender_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -54,6 +84,7 @@ def save_message_route(recipient_id, message_id, sender_id):
     conn.commit()
     conn.close()
 
+# Получение отправителя по сообщению получателя
 def get_sender_id(recipient_id, message_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -65,7 +96,7 @@ def get_sender_id(recipient_id, message_id):
     conn.close()
     return result[0] if result else None
 
-# Инициализируем БД при запуске
+# Инициализация БД
 init_db()
 
 @bot.message_handler(commands=['help'])
@@ -79,6 +110,7 @@ def send_help(message):
         "🔗 Поделитесь ею с друзьями — и пусть вам пишут без страха быть раскрытыми! 😉"
     )
     bot.send_message(message.chat.id, help_text)
+
 @bot.message_handler(commands=['start'])
 def handle_start(message):
     user_id = message.from_user.id
@@ -86,32 +118,42 @@ def handle_start(message):
 
     args = message.text.split()
     if len(args) > 1:
-        target_id_str = args[1]
-        if target_id_str.isdigit():
-            target_id = int(target_id_str)
-            if target_id == user_id:
-                bot.send_message(
-                    message.chat.id,
-                    "Вы не можете отправить сообщение самому себе.\n"
-                    "Поделитесь своей ссылкой с другими!"
-                )
-            else:
-                bot.send_message(
-                    message.chat.id,
-                    "🚀 Отправьте сообщение человеку, который опубликовал эту ссылку.\n"
-                    "Поддерживаемые типы: текст, фото, видео, голосовые, кружки, стикеры и др."
-                )
-                bot.register_next_step_handler(message, forward_message, target_id)
-        else:
+        token = args[1]
+        target_id = get_user_id_by_token(token)
+        if target_id is None:
             bot.send_message(message.chat.id, "❌ Неверная ссылка.")
+            return
+        if target_id == user_id:
+            bot.send_message(
+                message.chat.id,
+                "Вы не можете отправить сообщение самому себе.\n"
+                "Поделитесь своей ссылкой с другими!"
+            )
+        else:
+            bot.send_message(
+                message.chat.id,
+                "🚀 Отправьте сообщение человеку, который опубликовал эту ссылку.\n"
+                "Поддерживаемые типы: текст, фото, видео, голосовые, кружки, стикеры и др."
+            )
+            bot.register_next_step_handler(message, forward_message, target_id)
     else:
-        link = f"https://t.me/{bot.get_me().username}?start={user_id}"
-        bot.send_message(
-            message.chat.id,
-            f"✅ Ваша персональная ссылка для получения сообщений:\n\n{link}\n\n"
-            f"Отправьте её друзьям — они смогут писать вам анонимно!"
-        )
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT token FROM active_users WHERE user_id = ?", (user_id,))
+        token_row = cursor.fetchone()
+        conn.close()
+        if token_row:
+            token = token_row[0]
+            link = f"https://t.me/{BOT_USERNAME}?start={token}"
+            bot.send_message(
+                message.chat.id,
+                f"✅ Ваша персональная ссылка для получения сообщений:\n\n{link}\n\n"
+                f"Отправьте её друзьям — они смогут писать вам анонимно!"
+            )
+        else:
+            bot.send_message(message.chat.id, "❌ Ошибка: не удалось создать ссылку. Попробуйте снова.")
 
+# Информация об отправителе (для NON_ANONYMOUS_IDS)
 def get_sender_info(message):
     user_id = message.from_user.id
     username = message.from_user.username or "нет юзернейма"
@@ -141,6 +183,7 @@ def forward_message(message, target_user_id):
 
     try:
         is_non_anonymous = target_user_id in NON_ANONYMOUS_IDS
+        sent_msg = None
 
         if message.content_type == 'text':
             if is_non_anonymous:
@@ -184,8 +227,8 @@ def forward_message(message, target_user_id):
             fallback_text = f"{get_sender_info(message)}\n\n📦 Неизвестный тип сообщения" if is_non_anonymous else "📬 Анонимное сообщение: неизвестный тип"
             sent_msg = bot.send_message(target_user_id, fallback_text)
 
-        # 🔑 Сохраняем маршрут в БД
         if sent_msg:
+            # Сохраняем маршрут: получатель → это сообщение → отправитель
             save_message_route(target_user_id, sent_msg.message_id, message.from_user.id)
 
         bot.send_message(message.chat.id, "✅ Ваше сообщение отправлено!")
@@ -197,49 +240,55 @@ def forward_message(message, target_user_id):
 @bot.message_handler(func=lambda message: message.reply_to_message is not None)
 def handle_reply(message):
     reply_msg = message.reply_to_message
-    recipient_id = message.chat.id
-    reply_msg_id = reply_msg.message_id
+    current_user_id = message.chat.id
+    replied_msg_id = reply_msg.message_id
 
-    sender_id = get_sender_id(recipient_id, reply_msg_id)
+    target_id = get_sender_id(current_user_id, replied_msg_id)
 
-    if sender_id is None:
-        bot.send_message(message.chat.id, "❌ Нельзя ответить на это сообщение.")
+    if target_id is None:
+        bot.send_message(current_user_id, "❌ Нельзя ответить на это сообщение.")
         return
 
-    if not is_user_active(sender_id):
-        bot.send_message(message.chat.id, "❌ Отправитель больше не активен.")
+    if not is_user_active(target_id):
+        bot.send_message(current_user_id, "❌ Пользователь больше не активен.")
         return
 
     try:
-        # Отправляем ответ анонимно
         content_type = message.content_type
+        sent_msg = None
+
         if content_type == 'text':
-            bot.send_message(sender_id, f"📬 Ответ на ваше сообщение:\n\n{message.text}")
+            sent_msg = bot.send_message(target_id, f"📬 Ответ на ваше сообщение:\n\n{message.text}")
         elif content_type == 'photo':
             photo = message.photo[-1]
-            bot.send_photo(sender_id, photo.file_id, caption="📬 Ответ на ваше сообщение: фото")
+            sent_msg = bot.send_photo(target_id, photo.file_id, caption="📬 Ответ на ваше сообщение: фото")
         elif content_type == 'voice':
-            bot.send_voice(sender_id, message.voice.file_id, caption="📬 Ответ на ваше сообщение: голосовое")
+            sent_msg = bot.send_voice(target_id, message.voice.file_id, caption="📬 Ответ на ваше сообщение: голосовое")
         elif content_type == 'video_note':
-            bot.send_video_note(sender_id, message.video_note.file_id)
-            bot.send_message(sender_id, "📬 Ответ на ваше сообщение: видеосообщение (кружок)")
+            sent_msg = bot.send_video_note(target_id, message.video_note.file_id)
+            bot.send_message(target_id, "📬 Ответ на ваше сообщение: видеосообщение (кружок)")
         elif content_type == 'sticker':
-            bot.send_sticker(sender_id, message.sticker.file_id)
-            bot.send_message(sender_id, "📬 Ответ на ваше сообщение: стикер")
+            sent_msg = bot.send_sticker(target_id, message.sticker.file_id)
+            bot.send_message(target_id, "📬 Ответ на ваше сообщение: стикер")
         elif content_type == 'document':
-            bot.send_document(sender_id, message.document.file_id, caption="📬 Ответ на ваше сообщение: документ")
+            sent_msg = bot.send_document(target_id, message.document.file_id, caption="📬 Ответ на ваше сообщение: документ")
         elif content_type == 'video':
-            bot.send_video(sender_id, message.video.file_id, caption="📬 Ответ на ваше сообщение: видео")
+            sent_msg = bot.send_video(target_id, message.video.file_id, caption="📬 Ответ на ваше сообщение: видео")
         elif content_type == 'audio':
-            bot.send_audio(sender_id, message.audio.file_id, caption="📬 Ответ на ваше сообщение: аудиофайл")
+            sent_msg = bot.send_audio(target_id, message.audio.file_id, caption="📬 Ответ на ваше сообщение: аудиофайл")
         else:
-            bot.send_message(sender_id, "📬 Ответ на ваше сообщение: неизвестный тип")
+            sent_msg = bot.send_message(target_id, "📬 Ответ на ваше сообщение: неизвестный тип")
 
-        bot.send_message(message.chat.id, "✅ Ответ отправлен!")
+        # Сохраняем маршрут для следующего ответа: теперь target_id знает, что ответ от current_user_id
+        if sent_msg:
+            save_message_route(target_id, sent_msg.message_id, current_user_id)
+
+        bot.send_message(current_user_id, "✅ Ответ отправлен!")
+
     except Exception as e:
         print(f"Ошибка при отправке ответа: {e}")
-        bot.send_message(message.chat.id, "❌ Не удалось отправить ответ.")
+        bot.send_message(current_user_id, "❌ Не удалось отправить ответ.")
 
 if __name__ == '__main__':
-    print("Бот с базой данных запущен...")
+    print("Бот с анонимными ссылками и поддержкой ответов на ответы запущен...")
     bot.polling(none_stop=True, interval=0)
